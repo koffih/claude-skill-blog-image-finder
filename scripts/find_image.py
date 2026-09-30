@@ -43,7 +43,7 @@ from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 USER_AGENT = f"Mozilla/5.0 (compatible; blog-image-finder/{VERSION}; +https://github.com/koffih/claude-skill-blog-image-finder)"
 CONFIG_FILE = Path(os.environ.get("BIF_CONFIG", "~/.config/blog-image-finder/keys.env")).expanduser()
 LEDGER_FILE = Path(os.environ.get("BIF_LEDGER", "~/.local/share/blog-image-finder/used.jsonl")).expanduser()
@@ -136,6 +136,8 @@ class Image:
     download_ping: str = ""   # Unsplash: URL to call when the photo is used
     score: float = 0.0
     score_detail: dict = field(default_factory=dict)
+    judge: dict = field(default_factory=dict)  # visual check: fit, place, reason
+    alt: dict = field(default_factory=dict)    # alt text per language, from the judge
 
     @property
     def orientation(self) -> str:
@@ -346,6 +348,19 @@ def score(img: Image, o: dict, n_results: int) -> None:
     img.score = round(35 * relevance + 15 * rank + 20 * resolution + 15 * orient + 15 * weight, 2)
 
 
+def shape_ok(w: int, h: int, o: dict) -> bool:
+    """Strict orientation: a portrait photo cropped to 16:9 keeps a sliver of the subject."""
+    want = o["orientation"]
+    if want == "any" or not w or not h:
+        return True
+    r = w / h
+    if want == "landscape":
+        return r >= o["min_ratio"]
+    if want == "portrait":
+        return r <= 1 / o["min_ratio"]
+    return 0.9 <= r <= 1.1
+
+
 # ---------------------------------------------------------------- ledger
 
 _ledger_lock = threading.Lock()
@@ -417,6 +432,8 @@ def run_search(queries: list[str], o: dict) -> tuple[list[Image], dict]:
             continue
         if im.width and im.width < o["min_width"]:
             continue
+        if not shape_ok(im.width, im.height, o):
+            continue
         seen.add(uid)
         kept.append(im)
     return kept, {"providers": report, "skipped_as_used": len(skipped & {f"{i.provider}:{i.id}" for i in results})}
@@ -424,35 +441,76 @@ def run_search(queries: list[str], o: dict) -> tuple[list[Image], dict]:
 
 # ---------------------------------------------------------------- image processing
 
-def process(data: bytes, o: dict) -> tuple[bytes, str, int, int]:
+# name -> (width, height, format). "blog" is what a blog template needs: the header
+# image, the card in article lists, and the Open Graph image that Facebook, LinkedIn
+# and WhatsApp show (JPEG, because WebP previews are unreliable on those networks).
+VARIANT_PRESETS = {
+    "blog": "cover:1600x900:webp,card:800x450:webp,og:1200x630:jpg",
+}
+
+
+def parse_variants(spec: str | None, o: dict) -> list[tuple[str, int, int, str]]:
+    """"single" (or empty) keeps the historical one-file output; otherwise name:WxH:fmt,..."""
+    if not spec or spec == "single":
+        return []
+    out = []
+    for part in VARIANT_PRESETS.get(spec, spec).split(","):
+        name, size, fmt = part.strip().split(":")
+        w, h = size.lower().split("x")
+        out.append((name, int(w), int(h), fmt))
+    return out
+
+
+def _encode(im, fmt: str, quality: int) -> tuple[bytes, str]:
+    buf = io.BytesIO()
+    if fmt == "webp":
+        im.save(buf, "WEBP", quality=quality, method=6)
+    elif fmt == "avif":
+        im.save(buf, "AVIF", quality=quality)
+    else:
+        fmt = "jpg"
+        im.save(buf, "JPEG", quality=quality, optimize=True, progressive=True)
+    return buf.getvalue(), fmt
+
+
+def _crop_to(im, ratio: float):
+    w, h = im.size
+    target_h = int(w / ratio)
+    if h > target_h:
+        top = int((h - target_h) * 0.35)  # subjects sit a little above center
+        return im.crop((0, top, w, top + target_h))
+    if h < target_h:
+        target_w = int(h * ratio)
+        left = (w - target_w) // 2
+        return im.crop((left, 0, left + target_w, h))
+    return im
+
+
+def open_rgb(data: bytes):
     try:
         from PIL import Image as PILImage
     except ImportError:
+        return None
+    return PILImage.open(io.BytesIO(data)).convert("RGB")
+
+
+def process(data: bytes, o: dict) -> tuple[bytes, str, int, int]:
+    im = open_rgb(data)
+    if im is None:
         return data, "orig", 0, 0
-    im = PILImage.open(io.BytesIO(data))
-    im = im.convert("RGB")
-    w, h = im.size
+    from PIL import Image as PILImage
     if o["crop"] and o["orientation"] == "landscape":
-        target_h = int(w / o["ratio"])
-        if h > target_h:
-            top = int((h - target_h) * 0.35)  # subjects sit a little above center
-            im = im.crop((0, top, w, top + target_h))
-        elif h < target_h:
-            target_w = int(h * o["ratio"])
-            left = (w - target_w) // 2
-            im = im.crop((left, 0, left + target_w, h))
+        im = _crop_to(im, o["ratio"])
     if im.width > o["target_width"]:
         im = im.resize((o["target_width"], round(im.height * o["target_width"] / im.width)), PILImage.LANCZOS)
-    buf = io.BytesIO()
-    fmt = o["format"]
-    if fmt == "webp":
-        im.save(buf, "WEBP", quality=o["quality"], method=6)
-    elif fmt == "avif":
-        im.save(buf, "AVIF", quality=o["quality"])
-    else:
-        fmt = "jpg"
-        im.save(buf, "JPEG", quality=o["quality"], optimize=True, progressive=True)
-    return buf.getvalue(), fmt, im.width, im.height
+    blob, fmt = _encode(im, o["format"], o["quality"])
+    return blob, fmt, im.width, im.height
+
+
+def render_variant(im, w: int, h: int, fmt: str, quality: int) -> tuple[bytes, str]:
+    """Crop to the exact ratio, then resize to the exact size so every page lays out the same."""
+    from PIL import Image as PILImage
+    return _encode(_crop_to(im, w / h).resize((w, h), PILImage.LANCZOS), fmt, quality)
 
 
 def slugify(s: str) -> str:
@@ -463,19 +521,39 @@ def slugify(s: str) -> str:
 def save(img: Image, data: bytes, o: dict) -> dict:
     out_dir = Path(o["out_dir"]).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
-    blob, fmt, w, h = process(data, o)
-    if fmt == "orig":
-        ext = {b"\xff\xd8": "jpg", b"\x89P": "png", b"RI": "webp"}.get(blob[:2], "jpg")
-    else:
-        ext = fmt
     stem = f"{slugify(o.get('name') or img.query)}-{img.provider}-{hashlib.sha1(img.id.encode()).hexdigest()[:8]}"
-    path = out_dir / f"{stem}.{ext}"
-    path.write_bytes(blob)
+    variants = parse_variants(o.get("variants"), o)
+    im = open_rgb(data) if variants else None
+    files: dict[str, dict] = {}
+    if im is not None:
+        # The listed size can lie (Pixabay, Wikimedia thumbnails): judge the real pixels.
+        if not shape_ok(im.width, im.height, o):
+            raise HttpError(0, f"real size {im.width}x{im.height} is not {o['orientation']}")
+        for name, w, h, fmt in variants:
+            blob, ext = render_variant(im, w, h, fmt, o["quality"])
+            path = out_dir / f"{stem}-{name}.{ext}"
+            path.write_bytes(blob)
+            files[name] = {"file": str(path), "width": w, "height": h, "bytes": len(blob), "format": ext}
+        main = next(iter(files.values()))
+        path, size = Path(main["file"]), main["bytes"]
+    else:
+        blob, fmt, w, h = process(data, o)
+        ext = {b"\xff\xd8": "jpg", b"\x89P": "png", b"RI": "webp"}.get(blob[:2], "jpg") if fmt == "orig" else fmt
+        path = out_dir / f"{stem}.{ext}"
+        path.write_bytes(blob)
+        size = len(blob)
+    if files:
+        w, h = main["width"], main["height"]
+        orig_w, orig_h = im.width, im.height
+    else:
+        orig_w, orig_h = img.width, img.height
     meta = {**{k: v for k, v in img.as_dict().items() if k not in ("score_detail", "width", "height", "orientation")},
-            "file": str(path), "bytes": len(blob), "width": w or img.width, "height": h or img.height,
-            "original_width": img.width, "original_height": img.height,
+            "file": str(path), "bytes": size, "width": w or img.width, "height": h or img.height,
+            "original_width": orig_w, "original_height": orig_h,
             "downloaded_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}
-    path.with_suffix(".json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    if files:
+        meta["files"] = files
+    (out_dir / f"{stem}.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     return meta
 
 
@@ -486,10 +564,119 @@ def fetch_bytes(url: str) -> bytes:
     return data
 
 
+# ---------------------------------------------------------------- visual judge
+
+JUDGE_PROMPT = """You pick the header photo of a blog article. The reader must not be misled.
+
+Article:
+{context}
+
+Below are {n} candidate photos, numbered in order. For EACH photo, judge from what you SEE:
+- fit: 0 to 10, how well it illustrates THIS article. 8+ is a photo an editor would
+  publish; 5 or less is generic, off-topic, or wrong.
+- place: where it visibly seems to be ("West Africa", "Europe", "North America",
+  "unknown"...). If the article is about a specific region and the photo clearly shows
+  another one (architecture, street signs, landscape, people, vehicles), fit is 3 at most.
+- Also 3 at most for: visible watermark or large text, a collage, a screenshot, an
+  illustration when a photo is expected, a recognisable famous landmark of another city.
+- reason: a few words.
+- alt: short factual alt text describing what the photo shows (not the article), in
+  each of these languages: {langs}. Never claim a place the photo does not prove.
+
+Answer with JSON only:
+{{"images": [{{"i": 1, "fit": 7, "place": "...", "reason": "...", "alt": {{{alt_keys}}}}}]}}"""
+
+
+def _judge_config() -> tuple[str, str, str] | None:
+    url = key("BIF_JUDGE_URL") or "https://api.moonshot.ai/v1"
+    k = key("BIF_JUDGE_KEY") or key("MOONSHOT_API_KEY")
+    model = key("BIF_JUDGE_MODEL") or "kimi-k2.6"
+    return (url.rstrip("/"), k, model) if k else None
+
+
+def _thumb_data_url(url: str) -> str:
+    data = fetch_bytes(url)
+    im = open_rgb(data)
+    if im is not None:
+        im.thumbnail((512, 512))
+        data, _ = _encode(im, "jpg", 80)
+    return "data:image/jpeg;base64," + base64.b64encode(data).decode()
+
+
+def _json_in(text: str) -> dict:
+    m = re.search(r"\{.*\}", text, re.S)
+    return json.loads(m.group(0)) if m else {}
+
+
+def judge(cands: list[Image], o: dict, report: dict) -> list[Image]:
+    """Look at the best candidates with a vision model and keep those that fit.
+
+    Any OpenAI compatible endpoint that accepts image_url data URLs works
+    (Moonshot kimi-k2.6 by default). Returns the accepted images, best first.
+    """
+    cfg = _judge_config()
+    if not cfg:
+        report["judge"] = {"error": "no judge key (BIF_JUDGE_KEY or MOONSHOT_API_KEY)"}
+        return []
+    url, k, model = cfg
+    langs = o["alt_langs"]
+    accepted: list[Image] = []
+    rounds = []
+    top = o["judge_top"]
+    for start in range(0, min(len(cands), top * o["judge_rounds"]), top):
+        batch = cands[start:start + top]
+        with ThreadPoolExecutor(max_workers=len(batch)) as pool:
+            thumbs = list(pool.map(lambda c: _safe(_thumb_data_url, c.preview_url or c.image_url), batch))
+        shown = [(c, t) for c, t in zip(batch, thumbs) if t]
+        if not shown:
+            continue
+        content = [{"type": "text", "text": JUDGE_PROMPT.format(
+            context=o["context"] or " / ".join({c.query for c in cands}), n=len(shown),
+            langs=", ".join(langs), alt_keys=", ".join(f'"{l}": "..."' for l in langs))}]
+        for i, (_, t) in enumerate(shown, 1):
+            content += [{"type": "text", "text": f"Photo {i}:"}, {"type": "image_url", "image_url": {"url": t}}]
+        body = {"model": model, "max_tokens": 4000, "messages": [{"role": "user", "content": content}]}
+        if "moonshot" in url:
+            body["thinking"] = {"type": "disabled"}  # a 0-10 grade needs no reasoning pass
+        t0 = time.monotonic()
+        try:
+            d = http(f"{url}/chat/completions", headers={"Authorization": f"Bearer {k}"}, data=body, timeout=120)
+            verdicts = _json_in(d["choices"][0]["message"]["content"]).get("images", [])
+        except Exception as e:
+            rounds.append({"shown": len(shown), "error": str(e)[:200]})
+            continue
+        rounds.append({"shown": len(shown), "seconds": round(time.monotonic() - t0, 1), "usage": d.get("usage")})
+        for v in verdicts:
+            try:
+                c = shown[int(v["i"]) - 1][0]
+            except (KeyError, ValueError, IndexError, TypeError):
+                continue
+            c.judge = {"fit": v.get("fit"), "place": v.get("place", ""), "reason": v.get("reason", ""), "model": model}
+            c.alt = v.get("alt") or {}
+            if isinstance(v.get("fit"), (int, float)) and v["fit"] >= o["judge_min"]:
+                accepted.append(c)
+        if accepted:
+            break
+    report["judge"] = {"model": model, "rounds": rounds, "accepted": len(accepted),
+                       "rejected": [f"{c.provider}:{c.id} fit {c.judge.get('fit')} ({c.judge.get('reason')})"
+                                    for c in cands if c.judge and c not in accepted]}
+    # The judge's fit decides; the heuristic score breaks ties.
+    return sorted(accepted, key=lambda c: (c.judge["fit"], c.score), reverse=True)
+
+
+def _safe(fn, *a):
+    try:
+        return fn(*a)
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------- pick
 
 def pick(queries: list[str], o: dict) -> dict:
     cands, report = run_search(queries, o)
+    if o["judge"] and cands:
+        cands = judge(cands, o, report)
     for img in cands:
         result = {"image": img.as_dict()}
         if o["download"]:
@@ -589,8 +776,9 @@ def generate(prompt: str, o: dict) -> dict:
                     image_url="", preview_url="", source_url="", width=w, height=h,
                     author=GEN_MODEL[g], license="AI-generated, see provider terms",
                     attribution="", text=full, query=prompt)
-        o2 = dict(o, crop=False)
-        meta = save(img, data, o2)
+        # Generators do not all honour the requested size (Cloudflare returns a square):
+        # crop like any photo, but never reject on shape.
+        meta = save(img, data, dict(o, orientation="any") if o.get("variants") not in (None, "single") else o)
         if o["record"]:
             record(img, o["site"], {"file": meta["file"]})
         return {"ok": True, "image": img.as_dict(), "saved": meta, "generation_errors": errors}
@@ -639,6 +827,11 @@ def options(ns) -> dict:
         "generate_prompt": getattr(ns, "prompt", None), "name": getattr(ns, "name", None),
         "generators": [g.strip() for g in getattr(ns, "generators", ",".join(GENERATORS)).split(",") if g.strip()],
         "style": getattr(ns, "style", ""), "seed": getattr(ns, "seed", None),
+        "min_ratio": ns.min_ratio, "variants": getattr(ns, "variants", "single"),
+        "judge": getattr(ns, "judge", False), "context": getattr(ns, "context", "") or "",
+        "judge_min": getattr(ns, "judge_min", 7), "judge_top": getattr(ns, "judge_top", 6),
+        "judge_rounds": getattr(ns, "judge_rounds", 2),
+        "alt_langs": [l.strip() for l in getattr(ns, "alt_langs", "en").split(",") if l.strip()],
     }
 
 
@@ -656,6 +849,8 @@ def common(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--per-provider", type=int, default=15)
     ap.add_argument("--site", default="default", help="ledger namespace: images are not reused within a site; * for all")
     ap.add_argument("--allow-reuse", action="store_true", help="ignore the ledger")
+    ap.add_argument("--min-ratio", type=float, default=1.3,
+                    help="landscape means width/height at least this (portrait: the inverse); others are dropped")
 
 
 def download_opts(ap: argparse.ArgumentParser) -> None:
@@ -666,6 +861,19 @@ def download_opts(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--quality", type=int, default=82)
     ap.add_argument("--no-crop", action="store_true")
     ap.add_argument("--dry-run", action="store_true", help="do not record the pick in the ledger")
+    ap.add_argument("--variants", default="single",
+                    help="single (one file), blog (cover 1600x900 webp, card 800x450 webp, og 1200x630 jpg) "
+                         "or name:WxH:fmt,...")
+
+
+def judge_opts(ap: argparse.ArgumentParser) -> None:
+    ap.add_argument("--judge", action="store_true",
+                    help="let a vision model look at the best candidates and reject those that do not fit")
+    ap.add_argument("--context", default="", help="what the article is about: title, summary, place")
+    ap.add_argument("--judge-min", type=int, default=7, help="minimum fit out of 10")
+    ap.add_argument("--judge-top", type=int, default=6, help="candidates shown per round")
+    ap.add_argument("--judge-rounds", type=int, default=2)
+    ap.add_argument("--alt-langs", default="en", help="alt text languages, for example fr,en")
 
 
 def gen_opts(ap: argparse.ArgumentParser) -> None:
@@ -699,18 +907,24 @@ def serve(ns) -> None:
             o = dict(base)
             q = params.get("queries") or params.get("q") or params.get("query") or []
             queries = [q] if isinstance(q, str) else list(q)
-            for k in ("orientation", "kind", "site", "format", "name", "license_policy", "generate_prompt", "style"):
+            for k in ("orientation", "kind", "site", "format", "name", "license_policy", "generate_prompt", "style",
+                      "variants", "context"):
                 if k in params:
                     o[k] = params[k]
-            for k in ("min_width", "target_width", "per_provider", "quality", "alternatives"):
+            for k in ("min_width", "target_width", "per_provider", "quality", "alternatives", "judge_min", "judge_top"):
                 if k in params:
                     o[k] = int(params[k])
             if "ratio" in params:
                 o["ratio"] = float(params["ratio"])
+            if "min_ratio" in params:
+                o["min_ratio"] = float(params["min_ratio"])
+            if "alt_langs" in params:
+                a = params["alt_langs"]
+                o["alt_langs"] = a.split(",") if isinstance(a, str) else list(a)
             if "providers" in params:
                 p = params["providers"]
                 o["providers"] = p.split(",") if isinstance(p, str) else p
-            for k in ("download", "generate_fallback", "dry_run", "allow_reuse"):
+            for k in ("download", "generate_fallback", "dry_run", "allow_reuse", "judge"):
                 if k in params:
                     v = params[k] in (True, "1", "true", "yes")
                     if k == "dry_run":
@@ -778,6 +992,7 @@ def main() -> int:
     common(p)
     download_opts(p)
     gen_opts(p)
+    judge_opts(p)
     p.add_argument("--alternatives", type=int, default=3)
     p.add_argument("--generate-fallback", action="store_true", help="generate with AI when no stock image fits")
     p.add_argument("--prompt", help="generation prompt for the fallback (default: first query)")
@@ -795,6 +1010,7 @@ def main() -> int:
     common(v)
     download_opts(v)
     gen_opts(v)
+    judge_opts(v)
     v.add_argument("--host", default="127.0.0.1")
     v.add_argument("--port", type=int, default=8765)
 

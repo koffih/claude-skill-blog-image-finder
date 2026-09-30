@@ -52,6 +52,9 @@ default `127.0.0.1` unless a reverse proxy with TLS sits in front.
 | POST | `/v1/pick` | `{"queries": [...], "download": true, "name": "slug", "site": "mysite", "orientation": "landscape", "target_width": 1600, "ratio": 1.777, "format": "webp", "generate_fallback": false, "dry_run": false}` | same JSON as the CLI; 404 when nothing fits |
 | POST | `/v1/generate` | `{"prompt": "...", "name": "slug"}` | generated image; 502 when every generator failed |
 
+Also accepted by `/v1/pick`: `variants` (`"blog"`), `judge` (true), `context`,
+`alt_langs` (`["fr", "en"]`), `judge_min`, `min_ratio`.
+
 Every field is optional except the queries (or the prompt). Server flags set
 the defaults, the request overrides them.
 

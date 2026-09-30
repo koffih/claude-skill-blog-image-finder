@@ -57,6 +57,21 @@ resized to 1600 px, WebP quality 82, strict commercial licenses. Useful flags:
 `--format jpg`, `--kind any` (also illustrations), `--providers pexels,pixabay`,
 `--license attribution-sa` (also CC BY-SA), `--dry-run` (do not record).
 
+Landscape is strict: anything narrower than `--min-ratio` (1.3) is dropped,
+both from the listed size and from the real pixels after download.
+
+`--variants blog` writes the three files a blog template needs from one pick:
+`cover` 1600x900 WebP, `card` 800x450 WebP, `og` 1200x630 JPEG (social
+previews). `saved.files` lists them. Custom sets: `--variants hero:1920x800:webp,og:1200x630:jpg`.
+
+`--judge --context "<title, summary, country>" --alt-langs fr,en` sends the six
+best candidates to a vision model (Moonshot `kimi-k2.6` by default, any OpenAI
+compatible endpoint through `BIF_JUDGE_URL`, `BIF_JUDGE_KEY`, `BIF_JUDGE_MODEL`).
+It grades each photo 0 to 10 on what it shows, caps at 3 a photo from the wrong
+region or a famous landmark of another city, keeps those at `--judge-min` (7)
+or above, and writes alt text in each language (`image.alt`). About 25 s and
+half a US cent per pick. `report.judge.rejected` says why the others lost.
+
 The result is JSON: `image` (provider, author, license, attribution, source
 URL, score), `saved` (file path, final size, bytes) and `alternatives`. A JSON
 sidecar with the same name keeps the license trail next to the image.
