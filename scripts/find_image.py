@@ -577,6 +577,13 @@ Below are {n} candidate photos, numbered in order. For EACH photo, judge from wh
 - place: where it visibly seems to be ("West Africa", "Europe", "North America",
   "unknown"...). If the article is about a specific region and the photo clearly shows
   another one (architecture, street signs, landscape, people, vehicles), fit is 3 at most.
+  A photo with NO visible regional cue is not a mismatch: grade it on its subject alone,
+  it can reach 8. A photo that visibly shows the article's own region earns +1.
+- wrong_region: true when the article is about a region and the photo visibly shows
+  another one. This is a hard veto, whatever the fit.
+- not_a_photo: true for a 3D render, CGI interior, illustration, drawing or heavy
+  digital art. Renders often pass as photos: look for too-perfect surfaces, uniform
+  lighting and no dust or wear. Hard veto when a photo is expected.
 - Also 3 at most for: visible watermark or large text, a collage, a screenshot, an
   illustration when a photo is expected, a recognisable famous landmark of another city.
 - reason: a few words.
@@ -584,7 +591,7 @@ Below are {n} candidate photos, numbered in order. For EACH photo, judge from wh
   each of these languages: {langs}. Never claim a place the photo does not prove.
 
 Answer with JSON only:
-{{"images": [{{"i": 1, "fit": 7, "place": "...", "reason": "...", "alt": {{{alt_keys}}}}}]}}"""
+{{"images": [{{"i": 1, "fit": 7, "place": "...", "wrong_region": false, "not_a_photo": false, "reason": "...", "alt": {{{alt_keys}}}}}]}}"""
 
 
 def _judge_config() -> tuple[str, str, str] | None:
@@ -651,14 +658,20 @@ def judge(cands: list[Image], o: dict, report: dict) -> list[Image]:
                 c = shown[int(v["i"]) - 1][0]
             except (KeyError, ValueError, IndexError, TypeError):
                 continue
-            c.judge = {"fit": v.get("fit"), "place": v.get("place", ""), "reason": v.get("reason", ""), "model": model}
+            c.judge = {"fit": v.get("fit"), "place": v.get("place", ""), "wrong_region": bool(v.get("wrong_region")),
+                       "not_a_photo": bool(v.get("not_a_photo")),
+                       "reason": v.get("reason", ""), "model": model}
             c.alt = v.get("alt") or {}
-            if isinstance(v.get("fit"), (int, float)) and v["fit"] >= o["judge_min"]:
+            # The fit alone let a "clearly New York" photo through at 6: the region veto is separate.
+            if isinstance(v.get("fit"), (int, float)) and v["fit"] >= o["judge_min"] and not c.judge["wrong_region"] \
+                    and not (o["kind"] == "photo" and c.judge["not_a_photo"]):
                 accepted.append(c)
         if accepted:
             break
     report["judge"] = {"model": model, "rounds": rounds, "accepted": len(accepted),
-                       "rejected": [f"{c.provider}:{c.id} fit {c.judge.get('fit')} ({c.judge.get('reason')})"
+                       "rejected": [f"{c.provider}:{c.id} fit {c.judge.get('fit')}{' wrong region' if c.judge.get('wrong_region') else ''}"
+                                    f"{' not a photo' if c.judge.get('not_a_photo') else ''}"
+                                    f" ({c.judge.get('reason')})"
                                     for c in cands if c.judge and c not in accepted]}
     # The judge's fit decides; the heuristic score breaks ties.
     return sorted(accepted, key=lambda c: (c.judge["fit"], c.score), reverse=True)
@@ -911,7 +924,8 @@ def serve(ns) -> None:
                       "variants", "context"):
                 if k in params:
                     o[k] = params[k]
-            for k in ("min_width", "target_width", "per_provider", "quality", "alternatives", "judge_min", "judge_top"):
+            for k in ("min_width", "target_width", "per_provider", "quality", "alternatives", "judge_min", "judge_top",
+                      "judge_rounds"):
                 if k in params:
                     o[k] = int(params[k])
             if "ratio" in params:
